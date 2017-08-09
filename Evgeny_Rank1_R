@@ -1,0 +1,351 @@
+library(data.table)
+library(beepr)
+library(Matrix)
+library(xgboost)
+devtools::install_github("Microsoft/LightGBM", subdir = "R-package")
+library(lightgbm)
+library(caret)
+
+
+bigGC <- function(nit=20) {for (j in 1:nit) a <-gc()}
+
+auc <- function (actual, predicted) {
+        r <- rank(predicted)
+        n_pos <- sum(actual == 1)
+        n_neg <- as.numeric(length(actual) - n_pos)
+        auc <- (sum(r[actual == 1]) - n_pos * (n_pos + 1)/2)/(n_pos * n_neg)
+        auc
+}
+
+run_all_to_sub <- function() {
+        
+        # load and process data
+        dt <- load_data()
+        dt <- process_data(dt)
+        
+        # run 3 lightGBM models with different random seeds        
+        pred_L1 <- run_train_and_predict(verb=-1, runxgb=F, nfolds=5, foldseed=7834, 
+                                         trainseed=3432, niter=850,  eta=.05, 
+                                         md=12, nl=200, ss=.9, cs=.75, gamma=0 )
+        pred_L2 <- run_train_and_predict(verb=-1, runxgb=F, nfolds=5, foldseed=7834, 
+                                         trainseed=92543, niter=850,  eta=.01, 
+                                         md=12, nl=200, ss=.9, cs=.75, gamma=0 )
+        bigGC()
+        pred_L3 <- run_train_and_predict(verb=-1, runxgb=F, nfolds=5, foldseed=7834, 
+                                         trainseed=1484, niter=850,  eta=.05, 
+                                         md=12, nl=200, ss=.9, cs=.75, gamma=0 )
+        # calc average predict from 3 lightGBM predicts
+        pr_lgb <- cbind(pred_lgb[loan_status==-1, .(member_id)], 
+                        pr_lgb1=pred_L1$pred, pr_lgb2=pred_L2$pred, pr_lgb3=pred_L3$pred)
+        pr_lgb[, lpr:= (pr_lgb1+pr_lgb2+pr_lgb3)/3]
+        save_sub(pr_lgb[,.(member_id, lpr)], 15)
+
+        # run 3 xgboost models with different random seeds        
+        pred_X1 <- run_train_and_predict(verb=-1, runxgb=T, nfolds=5, foldseed=7834, 
+                                         trainseed=3432, niter=850,  eta=.05, 
+                                         md=12, nl=00, ss=.8, cs=.8, gamma=0 )
+        pred_X2 <- run_train_and_predict(verb=-1, runxgb=T, nfolds=5, foldseed=7834, 
+                                         trainseed=67943, niter=850,  eta=.05, 
+                                         md=12, nl=00, ss=.8, cs=.8, gamma=0 )
+        pred_X3 <- run_train_and_predict(verb=-1, runxgb=T, nfolds=5, foldseed=7834, 
+                                         trainseed=15937, niter=850,  eta=.05, 
+                                         md=12, nl=00, ss=.8, cs=.8, gamma=0 )
+        
+        # calc average predict from 3 xgboost predicts
+        pr_xgb <- cbind(pred_xgb[loan_status==-1, .(member_id)], 
+                        pr_xgb1=pred_X1$pred, pr_xgb2=pred_X2$pred, pr_xgb3=pred_X3$pred)
+        pr_xgb[, xpr:= (pr_xgb1+pr_xgb2+pr_xgb3)/3]
+        save_sub(pr_xgb[,.(member_id, xpr)], 16)
+
+        # calc weighted average predict from xgboost and lightGBM predicts and save submission
+        pr_fin <- cbind(pr_xgb[, .(member_id, xpr)],pr_lgb[, .(lpr)])
+        save_sub(pr_fin[,.(member_id, (xpr*6+lpr*4)/10)], 17)
+}
+
+
+load_data <- function() {
+        
+        # load and union train and test
+        col_types <- readRDS("Data/col_types.rds")
+        dt_tr <- fread("train_indessa.csv")#, #colClasses = col_types)
+        dt_te <- fread("test_indessa.csv")
+        dt_te[, loan_status:=-1]
+        dt <- rbindlist(list(dt_tr,dt_te))
+        
+        rm(dt_tr)
+        rm(dt_te)
+        bigGC(10)
+        
+        dt
+}
+
+
+process_data <- function(dt1) {
+        
+        # process features - 1st stage - convert to int/num or as factors
+        
+        dt <- copy(dt1)
+        
+        dt[, last_week_pay:= as.integer(substr(last_week_pay, 1, regexpr('th', last_week_pay)-1 ))]
+        dt[is.na(last_week_pay), last_week_pay:=-1]
+        dt[, term:= as.integer(substr(term,1, regexpr(' ', term)-1 ))]
+        dt[, batch_enrolled:=as.factor(batch_enrolled)]
+        
+        dt[regexpr('+', emp_length, fixed=T)>0, emp_length:= "10"]
+        dt[regexpr('<'  , emp_length, fixed=T)>0, emp_length:= "0"]
+        dt[regexpr('n/a', emp_length, fixed=T)>0, emp_length:= "-1"]
+        dt[regexpr(' ', emp_length, fixed=T)>0, emp_length:= substr(emp_length, 1, 2 )]
+        dt[, emp_length:= as.integer(emp_length)]
+        
+        dt[verification_status=='Not Verified', verification_status:="0"]
+        dt[verification_status=='Verified', verification_status:="1"]
+        dt[verification_status=='Source Verified', verification_status:="2"]
+        dt[, verification_status:=as.integer(verification_status)]
+        
+        dt[verification_status_joint=='', verification_status_joint:="0"]
+        dt[verification_status_joint=='Not Verified', verification_status_joint:="1"]
+        dt[verification_status_joint=='Verified', verification_status_joint:="2"]
+        dt[verification_status_joint=='Source Verified', verification_status_joint:="3"]
+        dt[, verification_status_joint:=as.integer(verification_status_joint)]
+        dt[verification_status_joint>0, verification_status:=3]
+        dt[, verification_status_joint:=NULL] # join with common status 
+        
+        dt[application_type=='INDIVIDUAL', application_type:="0"]
+        dt[application_type=='JOINT', application_type:="1"]
+        dt[, application_type:=as.integer(application_type)]
+        dt[, application_type:=NULL] # no useful information
+        
+        
+        dt[sub_grade=="A1", sub_grade:="11"]
+        dt[sub_grade=="A2", sub_grade:="12"]
+        dt[sub_grade=="A3", sub_grade:="13"]
+        dt[sub_grade=="A4", sub_grade:="14"]
+        dt[sub_grade=="A5", sub_grade:="15"]
+        dt[sub_grade=="B1", sub_grade:="21"]
+        dt[sub_grade=="B2", sub_grade:="22"]
+        dt[sub_grade=="B3", sub_grade:="23"]
+        dt[sub_grade=="B4", sub_grade:="24"]
+        dt[sub_grade=="B5", sub_grade:="25"]
+        dt[sub_grade=="C1", sub_grade:="31"]
+        dt[sub_grade=="C2", sub_grade:="32"]
+        dt[sub_grade=="C3", sub_grade:="33"]
+        dt[sub_grade=="C4", sub_grade:="34"]
+        dt[sub_grade=="C5", sub_grade:="35"]
+        dt[sub_grade=="D1", sub_grade:="41"]
+        dt[sub_grade=="D2", sub_grade:="42"]
+        dt[sub_grade=="D3", sub_grade:="43"]
+        dt[sub_grade=="D4", sub_grade:="44"]
+        dt[sub_grade=="D5", sub_grade:="45"]
+        dt[sub_grade=="E1", sub_grade:="51"]
+        dt[sub_grade=="E2", sub_grade:="52"]
+        dt[sub_grade=="E3", sub_grade:="53"]
+        dt[sub_grade=="E4", sub_grade:="54"]
+        dt[sub_grade=="E5", sub_grade:="55"]
+        dt[sub_grade=="F1", sub_grade:="61"]
+        dt[sub_grade=="F2", sub_grade:="62"]
+        dt[sub_grade=="F3", sub_grade:="63"]
+        dt[sub_grade=="F4", sub_grade:="64"]
+        dt[sub_grade=="F5", sub_grade:="65"]
+        dt[sub_grade=="G1", sub_grade:="71"]
+        dt[sub_grade=="G2", sub_grade:="72"]
+        dt[sub_grade=="G3", sub_grade:="73"]
+        dt[sub_grade=="G4", sub_grade:="74"]
+        dt[sub_grade=="G5", sub_grade:="75"]
+        dt[, sub_grade:=as.integer(sub_grade)]
+        
+        dt[pymnt_plan=='n', pymnt_plan:="0"]
+        dt[pymnt_plan=='y', pymnt_plan:="1"]
+        dt[, pymnt_plan:=as.integer(pymnt_plan)]
+        dt[, pymnt_plan:=NULL] # no useful information
+        
+        dt[, purpose:=as.factor(purpose)]
+        dt[, zip_code:= as.factor(substr(zip_code, 1, 3 ))] 
+        dt[, addr_state:=as.factor(addr_state)]
+        
+        dt[initial_list_status=='f', initial_list_status:="0"]
+        dt[initial_list_status=='w', initial_list_status:="1"]
+        dt[, initial_list_status:=as.integer(initial_list_status)]
+        
+        dt[is.na(annual_inc), annual_inc:=-1]
+        dt[is.na(delinq_2yrs), ':='(delinq_2yrs=-1, inq_last_6mths=-1, open_acc=-1, 
+                                    pub_rec=-1, total_acc=-1, acc_now_delinq=-1)]
+        dt[is.na(mths_since_last_delinq), mths_since_last_delinq:=-1]
+        dt[, mths_since_last_delinq:=mths_since_last_delinq+1]
+        dt[is.na(mths_since_last_record), mths_since_last_record:=-1]
+        dt[, mths_since_last_record:=mths_since_last_record+1]
+        dt[is.na(mths_since_last_major_derog), mths_since_last_major_derog:=-1]
+        dt[, mths_since_last_major_derog:=mths_since_last_major_derog+1]
+        
+        dt[is.na(revol_util), revol_util:=0]
+        dt[is.na(collections_12_mths_ex_med), collections_12_mths_ex_med:=-1]
+        
+        dt[is.na(tot_coll_amt), ':='(tot_coll_amt=-1, tot_cur_bal=-1, total_rev_hi_lim=-1)]
+        
+        dt[home_ownership %in% c("ANY","NONE","OTHER"), home_ownership:="-1"]
+        dt[home_ownership %in% c("RENT"), home_ownership:="0"]
+        dt[home_ownership %in% c("MORTGAGE"), home_ownership:="1"]
+        dt[home_ownership %in% c("OWN"), home_ownership:="2"]
+        dt[, home_ownership:=as.integer(home_ownership)]
+
+        dt[collections_12_mths_ex_med >1, collections_12_mths_ex_med:=1L]
+        
+        dt
+}
+create_new_features <- function(dt) {
+        
+        #add new features to model
+        
+        dt[, emp_title:=NULL]
+        dt[, title:=NULL]
+
+        dt[, I:=.I]
+        dt[, ndesc:=nchar(desc), by=I]
+        dt[, desc:=NULL]
+        dt[, I:=NULL]
+        
+        dt[collections_12_mths_ex_med >1, collections_12_mths_ex_med:=1L]
+        
+        dt[, loan_appr_b:=funded_amnt/loan_amnt]
+        dt[, loan_appr_i:=funded_amnt_inv/loan_amnt]
+        dt[, loan_appr_bi:=funded_amnt_inv/funded_amnt]
+        
+        dt[, funded_term:=funded_amnt/term]
+        dt[, funded_purp_sgrade:=(funded_term)/mean(funded_term), by=.(purpose, sub_grade)]
+
+        dt[, annual_inc_prec:=as.integer((annual_inc %% 100)>0) ]
+        
+        dt[, int_r_subgrade:=int_rate/mean(int_rate), by=.(sub_grade)]
+        dt[, int_r_batch:=(int_rate-mean(int_rate))/sd(int_rate), by=.(batch_enrolled)]
+        dt[is.na(int_r_batch), int_r_batch:=(int_rate-mean(int_rate)), by=.(batch_enrolled)]
+        
+        dt[, annual_inc_mean_batch:=mean(annual_inc), by=.(batch_enrolled)]
+        dt[, annual_inc_sd_batch:=sd(annual_inc), by=.(batch_enrolled)]
+        dt[, batch_count:=.N, by=.(batch_enrolled)]
+        dt[, funded_amnt_mean_batch:=mean(funded_amnt), by=.(batch_enrolled)]
+        dt[, funded_amnt_sd_batch:=sd(funded_amnt), by=.(batch_enrolled)]
+        
+        dt[, last_week_pay_by_batch:=(last_week_pay-mean(last_week_pay))/sd(last_week_pay), by=.(batch_enrolled)]
+        dt[is.na(last_week_pay_by_batch), last_week_pay_by_batch:=(last_week_pay-mean(last_week_pay)), by=.(batch_enrolled)]
+        dt[, last_week_pay_by_id300k:=(last_week_pay-mean(last_week_pay))/sd(last_week_pay), by=.(ceiling(member_id/300000)*300000)]
+        dt[is.na(last_week_pay_by_id300k), last_week_pay_by_id300k:=(last_week_pay-mean(last_week_pay)), by=.(ceiling(member_id/300000)*300000)]
+        
+        dt[, total_rec_int_to_funded:=total_rec_int/(funded_amnt*int_rate)]
+        dt[, tot_coll_amt_to_funded:=tot_coll_amt/funded_amnt]
+        dt[, total_rec_int_to_funded_to_term:=total_rec_int_to_funded/term]
+        dt[, total_rec_int_to_funded_by_sgrade:=(total_rec_int_to_funded-mean(total_rec_int_to_funded))/
+                   sd(total_rec_int_to_funded), by=.(sub_grade)]
+        dt[is.na(total_rec_int_to_funded_by_sgrade), total_rec_int_to_funded_by_sgrade:=(total_rec_int_to_funded-mean(total_rec_int_to_funded)),
+           by=.(sub_grade)]
+        
+        dt[, total_rec_late_fee_by_sgrade:=(total_rec_late_fee-mean(total_rec_late_fee))/
+                   sd(total_rec_late_fee), by=.(sub_grade)]
+        dt[is.na(total_rec_late_fee_by_sgrade), total_rec_late_fee_by_sgrade:=(total_rec_late_fee-mean(total_rec_late_fee)),
+           by=.(sub_grade)]
+        
+        dt[, revol_util_sgrade1:=(revol_util-mean(revol_util))/sd(revol_util), by=.(sub_grade, collections_12_mths_ex_med)]
+        dt[is.na(revol_util_sgrade1), revol_util_sgrade1:=(revol_util-mean(revol_util)), by=.(sub_grade, collections_12_mths_ex_med)]
+
+        dt[, state_count:=.N, by=.(addr_state)]
+        
+        dt[, cred_str:=1L]
+        dt[ tot_cur_bal==(-1), cred_str:=-1L] # n\a
+        dt[(cred_str==1 & (funded_amnt*(1+int_rate/100) >= tot_cur_bal)), cred_str:=3L] # only current credit
+        dt[(cred_str==1 & (tot_cur_bal*.99 < total_rev_hi_lim)), cred_str:=2L]  # only revolv debt
+        dt[(cred_str==1 & (tot_cur_bal- total_rev_hi_lim)>30000), cred_str:=0L] # mortgage
+
+        dt[, loan_amnt:=NULL]
+        dt[, funded_amnt:=NULL]
+        dt[, funded_amnt_inv:=NULL]
+
+        dt[, grade:=NULL]
+        
+
+        dt
+}
+run_train_and_predict <- function(verb=1, runxgb=T, nfolds=5, foldseed=7834, trainseed=3432, niter=10, 
+                                  eta=.05, md=7, nl=40, ss=.5, cs=.5, gamma=0) {
+        
+        dt0 <<- dt[loan_status>=-1, ]
+        setkey(dt0, member_id)
+        
+        dt0 <<- create_new_features(dt0)
+        setkey(dt0, member_id)
+        
+        dt <- copy(dt0)
+        
+        if (runxgb) {
+
+                src  <- sparse.model.matrix(loan_status ~ .,  data = dt[loan_status>=0])
+                name4xgb <<- src[1,]
+                tr_xgb  <<- xgb.DMatrix(data=src , label=dt[loan_status>=0, loan_status])
+                rm(src)
+                
+                src  <- sparse.model.matrix(loan_status ~ .,  data = dt[loan_status<0])
+                te_xgb  <<- xgb.DMatrix(data=src , label=dt[loan_status<0, loan_status])
+                rm(src)
+                
+                watchlist <- list(t=tr_xgb)
+                params <- list( booster = "gbtree", objective = "binary:logistic", 
+                                eval_metric = "auc",
+                                eta = eta, max_depth = md,  
+                                subsample = ss, colsample_bytree = cs, 
+                                gamma=gamma, 
+                                nthread=2)
+                if (verb < 0) verb <- 0
+                set.seed(trainseed)
+                resmod <- xgb.train(params = params, data= tr_xgb, nrounds= niter, 
+                                    watchlist= watchlist, verbose= verb, 
+                                    print_every_n = ifelse(eta>=.05,5L,50L))
+                
+                pred <- predict(resmod, te_xgb)
+        }
+        else {
+                
+                dt[, zip_code:= as.integer(zip_code)]
+                dt[, addr_state:= as.integer(addr_state)]
+                cat_feat <- c('zip_code','addr_state')
+                
+                dt_names <- colnames(dt)
+                cat_feat <- match(cat_feat, dt_names)
+                
+                src  <- sparse.model.matrix(loan_status ~ .,  data = dt[loan_status>=0])
+                tr_lgb  <<- lgb.Dataset(data=src , label=dt[loan_status>=0, loan_status], 
+                                        categorical_feature=cat_feat)
+                rm(src)
+                
+                src  <<- sparse.model.matrix(loan_status ~ .,  data = dt[loan_status<0])
+
+                watchlist <- list(t=tr_lgb)
+                params <- list( objective = "binary", metric  = "auc",
+                                learning_rate = eta, 
+                                num_leaves=nl, max_depth = md,  
+                                bagging_fraction = ss, bagging_freq=1,
+                                bagging_seed = trainseed,
+                                feature_fraction = cs, feature_fraction_seed = trainseed)
+                set.seed(trainseed)
+                resmod <- lgb.train(params = params, data= tr_lgb, nrounds= niter, 
+                                    valids= watchlist, 
+                                    verbose = verb,record=T, eval_freq = 50L, 
+                                    num_threads=2)
+                
+                pred <- predict(resmod, data=src, num_iteration=niter)
+        }
+        dt0[loan_status<0, pr:=pred]
+        rm(dt)
+        
+        if (runxgb) pred_xgb <<- dt0
+        else pred_lgb <<- dt0
+        
+        bigGC()
+        a <- beep()
+        
+        list(mod=resmod, pred=pred)
+}
+
+save_sub <- function(pred, nsub) {
+        names(pred) <- c("member_id", "loan_status")
+        sname <- paste("sub", nsub, ".csv", sep="",collapse = "")
+        write.csv(pred, sname, row.names = FALSE, quote = FALSE)
+}
+
+run_all_to_sub()
